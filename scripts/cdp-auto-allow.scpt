@@ -110,7 +110,14 @@ on scanProcess(chromeProcess, processLabel, dryRun)
 				end if
 				if isSmallDialog then
 					my debugLog(processLabel & " detected small AXUnknown window — may be CDP dialog container")
-					my approveViaKeystroke(dryRun)
+					-- 先试安全路径：直接在这个窗口里找并点 Allow 按钮
+					if my clickAllowButton(targetWindow) then
+						my debugLog(processLabel & " approved small dialog via button click")
+					else
+						-- 兜底：激活【弹框所在的那个浏览器本身】（不再写死 Google Chrome）、
+						-- 抬升这个具体窗口、再回车，避免把回车送到别的窗口
+						my approveViaKeystroke(processLabel, targetWindow, dryRun)
+					end if
 				else if (wname as text) is "<noname>" then
 					try
 						set hasCancel to false
@@ -174,25 +181,30 @@ on scanContainer(targetElement, dryRun)
 	end tell
 end scanContainer
 
-on approveViaKeystroke(dryRun)
+on approveViaKeystroke(processLabel, targetWindow, dryRun)
 	set currentTime to (do shell script "date +%s") as number
 	if currentTime - lastApprovalTime < minApprovalInterval then
 		my debugLog("Skipping keystroke approval, too soon since last approval")
 		return
 	end if
 	set lastApprovalTime to currentTime
-	my debugLog("Approving via keystroke (activate + Return)")
+	my debugLog("Approving via keystroke on " & processLabel & " (raise target window + Return)")
 	if dryRun then
-		my debugLog("Dry run: would activate Chrome and press Return")
+		my debugLog("Dry run: would raise target window of " & processLabel & " and press Return")
 		return
 	end if
 	try
-		tell application "Google Chrome" to activate
+		-- 激活弹框所在的那个浏览器本身（Chrome / Canary / Chromium），不再写死 Google Chrome
+		tell application processLabel to activate
 		delay 0.3
 		tell application "System Events"
+			-- 先把检测到的那个具体窗口抬到最前，确保回车送到它身上，而非别的窗口
+			try
+				perform action "AXRaise" of targetWindow
+			end try
 			keystroke return
 		end tell
-		my debugLog("Sent Return keystroke to approve dialog")
+		my debugLog("Sent Return keystroke to " & processLabel & " target window")
 	on error errMsg
 		my debugLog("Keystroke approval failed: " & errMsg)
 	end try
