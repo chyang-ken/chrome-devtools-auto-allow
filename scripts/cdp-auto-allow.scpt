@@ -248,9 +248,12 @@ on clickAllowButton(rootElement)
 			end ignoring
 			if isButton then
 				set buttonText to my buttonLabel(rootElement)
+				-- 用空格做词边界，要求允许词作为【完整单词】出现，
+				-- 避免 "Bookmark this tab" 里的 "bo-ok-mark" 子串命中 "Ok" 这类误判
+				set paddedText to " " & buttonText & " "
 				ignoring case
 					repeat with buttonName in allowButtonNames
-						if buttonText contains (buttonName as text) then
+						if paddedText contains (" " & (buttonName as text) & " ") then
 							my debugLog("Clicking allow button: " & buttonText)
 							click rootElement
 							return true
