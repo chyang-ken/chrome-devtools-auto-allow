@@ -4,6 +4,7 @@ property allowButtonNames : {"Allow", "允许", "允許", "OK", "Ok", "确定", 
 property requiredTerms : {"DevTools", "Developer Tools", "remote debugging", "CDP", "chrome-devtools", "MCP", "remote debugging connection", "another program is trying", "远程调试", "遠端偵錯", "遠端調試"}
 property confirmationTerms : {"wants full control", "debug it", "saved data", "cookies and site data", "trusted apps", "external app", "navigate to any URL"}
 property debugLogPath : "/tmp/cdp-auto-allow.debug.log"
+property deadlinePath : "/tmp/cdp-auto-allow.deadline"
 property lastApprovalTime : 0
 property minApprovalInterval : 3
 
@@ -28,6 +29,18 @@ on run argv
 	my debugLog("script started, interval=" & pollInterval & " dry=" & dryRun)
 
 	repeat
+		-- 到点自杀：存在 deadline 文件且已过期则退出（watch 窗口模式）；
+		-- 无 deadline 文件 = 永久运行（start 模式）。每轮重读，便于 watch 续期。
+		try
+			set dl to (do shell script "cat " & quoted form of deadlinePath & " 2>/dev/null || echo 0") as number
+			if dl > 0 then
+				set nowT to (do shell script "date +%s") as number
+				if nowT > dl then
+					my debugLog("watch window expired (deadline " & dl & "), exiting")
+					return
+				end if
+			end if
+		end try
 		try
 			my scanChromiumBrowsers(dryRun)
 		on error errMsg number errNum
@@ -146,9 +159,10 @@ on scanProcess(chromeProcess, processLabel, dryRun)
 					on error errMsg
 						my debugLog("Unnamed window check error: " & errMsg)
 					end try
-				else
-					my scanContainer(targetWindow, dryRun)
 				end if
+				-- 标准命名窗口【不】做 scanContainer 整页递归：textOfElement 会遍历整棵辅助功能树，
+				-- 在 Google Ads / Gmail 等重页面上会卡死几十秒（实测看守卡在第一个窗口再没动）。
+				-- 授权框是 sheet，由下面的 sheet 扫描兜住，又快又准，顺带不再误匹配页面正文。
 				try
 					set sheetList to every sheet of targetWindow
 				on error
