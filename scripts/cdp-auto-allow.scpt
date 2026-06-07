@@ -1,12 +1,13 @@
 use scripting additions
 
+-- 授权框是挂在某个窗口上的 sheet，带 Allow + Cancel 两个按钮，文字含 "remote debugging /
+-- wants full control" 之类。本脚本只找这种 sheet 并点 Allow，不读整页文字、不整树递归
+-- （旧实现对每个普通窗口递归整棵辅助功能树，在 Google Ads/Gmail 等重页面上会卡死几十秒）。
 property allowButtonNames : {"Allow", "允许", "允許", "OK", "Ok", "确定", "確認", "好"}
-property requiredTerms : {"DevTools", "Developer Tools", "remote debugging", "CDP", "chrome-devtools", "MCP", "remote debugging connection", "another program is trying", "远程调试", "遠端偵錯", "遠端調試"}
-property confirmationTerms : {"wants full control", "debug it", "saved data", "cookies and site data", "trusted apps", "external app", "navigate to any URL"}
+property cancelButtonNames : {"Cancel", "取消", "取消", "Don't allow", "Deny"}
+property debugTerms : {"debug", "remote", "full control", "远程", "遠端", "调试", "調試"}
 property debugLogPath : "/tmp/cdp-auto-allow.debug.log"
 property deadlinePath : "/tmp/cdp-auto-allow.deadline"
-property lastApprovalTime : 0
-property minApprovalInterval : 3
 
 on debugLog(msg)
 	try
@@ -36,7 +37,7 @@ on run argv
 			if dl > 0 then
 				set nowT to (do shell script "date +%s") as number
 				if nowT > dl then
-					my debugLog("watch window expired (deadline " & dl & "), exiting")
+					my debugLog("watch window expired, exiting")
 					return
 				end if
 			end if
@@ -50,286 +51,167 @@ on run argv
 	end repeat
 end run
 
+-- 按 bundle id 囊括所有 Chrome 系进程，含【PWA / 安装成 Mac App 的网站】。
+-- 关键：PWA 是独立进程，名字叫 app_mode_loader、不叫 "Google Chrome"，
+-- 授权框常弹进当前最前的 PWA 里——按进程名找会整个漏掉（实测踩坑：ChatGPT PWA）。
+-- bundle id 前缀：com.google.Chrome（主 Chrome / Canary / PWA com.google.Chrome.app.*）、
+-- org.chromium（Chromium）、com.microsoft.edgemac（Edge 及其 PWA）。
 on scanChromiumBrowsers(dryRun)
-	set foundAny to false
 	tell application "System Events"
-		if exists process "Google Chrome" then
-			set foundAny to true
-			my scanProcess(process "Google Chrome", "Google Chrome", dryRun)
-		end if
-		if exists process "Google Chrome Canary" then
-			set foundAny to true
-			my scanProcess(process "Google Chrome Canary", "Google Chrome Canary", dryRun)
-		end if
-		if exists process "Chromium" then
-			set foundAny to true
-			my scanProcess(process "Chromium", "Chromium", dryRun)
-		end if
+		set procs to {}
+		try
+			set procs to procs & (application processes whose bundle identifier starts with "com.google.Chrome")
+		end try
+		try
+			set procs to procs & (application processes whose bundle identifier starts with "org.chromium")
+		end try
+		try
+			set procs to procs & (application processes whose bundle identifier starts with "com.microsoft.edgemac")
+		end try
+		repeat with p in procs
+			set pLabel to "?"
+			try
+				set pLabel to name of p
+			end try
+			my scanProcess(p, pLabel, dryRun)
+		end repeat
 	end tell
-	if not foundAny then my debugLog("tick: no chromium process found")
 end scanChromiumBrowsers
 
+-- 在一个浏览器进程里找授权 sheet 并点 Allow。
+-- 顺序：焦点窗口优先（命中就秒退）→ 全部窗口兜底（用户切走窗口时 sheet 仍在原窗口）。
 on scanProcess(chromeProcess, processLabel, dryRun)
 	tell application "System Events"
 		tell chromeProcess
+			set ordered to {}
+			-- 1) 焦点窗口排最前（加速：授权框通常挂在连接发生时的活动窗口上）
 			try
-				set windowList to every window
-			on error errMsg number errNum
-				my debugLog(processLabel & " windows error " & errNum & ": " & errMsg)
-				set windowList to {}
+				set end of ordered to (value of attribute "AXFocusedWindow")
 			end try
-			my debugLog(processLabel & " window count=" & (count of windowList))
-
-			-- Chrome 未激活时 Accessibility 可能看不到窗口，尝试激活后重扫
-			if (count of windowList) is 0 then
-				my debugLog(processLabel & " window count=0, trying to activate")
+			-- 2) 追加所有窗口做兜底覆盖（焦点窗口会被再查一次，无害）
+			try
+				repeat with w in (every window)
+					set end of ordered to (contents of w)
+				end repeat
+			end try
+			-- 3) Chrome 未激活时可能读不到窗口，激活后再补一次
+			if (count of ordered) is 0 then
 				try
 					tell application processLabel to activate
-					delay 0.5
-					set windowList to every window
-					my debugLog(processLabel & " window count after activate=" & (count of windowList))
-				on error errMsg
-					my debugLog(processLabel & " activate failed: " & errMsg)
+					delay 0.3
+					repeat with w in (every window)
+						set end of ordered to (contents of w)
+					end repeat
 				end try
 			end if
 
-			repeat with w in windowList
-				set targetWindow to contents of w
+			repeat with win in ordered
+				set shts to {}
 				try
-					set wname to name of targetWindow
-				on error
-					set wname to "<noname>"
+					set shts to every sheet of win
 				end try
-				try
-					set wSubrole to subrole of targetWindow as text
-				on error
-					set wSubrole to ""
-				end try
-
-				my debugLog(processLabel & " window: " & (wname as text) & " subrole=" & wSubrole)
-
-				-- 检测到 Chrome 远程调试弹窗容器（AXUnknown + 小尺寸窗口）
-				set isSmallDialog to false
-				if wSubrole is "AXUnknown" then
-					try
-						set wSize to size of targetWindow
-						set wWidth to item 1 of wSize
-						set wHeight to item 2 of wSize
-						if wWidth < 600 and wHeight < 600 then set isSmallDialog to true
-						my debugLog(processLabel & " AXUnknown window size=" & wWidth & "x" & wHeight)
-					on error
-						set isSmallDialog to true
-					end try
-				end if
-				if isSmallDialog then
-					my debugLog(processLabel & " detected small AXUnknown window — may be CDP dialog container")
-					-- 先试安全路径：直接在这个窗口里找并点 Allow 按钮
-					if my clickAllowButton(targetWindow) then
-						my debugLog(processLabel & " approved small dialog via button click")
-					else
-						-- 兜底：激活【弹框所在的那个浏览器本身】（不再写死 Google Chrome）、
-						-- 抬升这个具体窗口、再回车，避免把回车送到别的窗口
-						my approveViaKeystroke(processLabel, targetWindow, dryRun)
-					end if
-				else if (wname as text) is "<noname>" then
-					try
-						set hasCancel to false
-						set hasAllow to false
-						try
-							if exists button "Cancel" of targetWindow then set hasCancel to true
-						end try
-						try
-							if exists button "Allow" of targetWindow then set hasAllow to true
-						end try
-						if hasCancel and hasAllow then
-							my debugLog("Unnamed window has Cancel+Allow buttons — treating as CDP prompt")
-							if dryRun then
-								my debugLog("Dry run: would click Allow on unnamed window")
-							else
-								try
-									click button "Allow" of targetWindow
-									my debugLog("Approved unnamed dialog window")
-								on error errMsg
-									my debugLog("Click Allow on unnamed window failed: " & errMsg)
-								end try
-							end if
+				repeat with s in shts
+					set allowBtn to my consentAllowButton(s)
+					if allowBtn is not missing value then
+						if dryRun then
+							my debugLog("Dry run: would click Allow on consent sheet (" & processLabel & ")")
 						else
-							my debugLog("Unnamed window missing Cancel/Allow buttons (allow=" & hasAllow & " cancel=" & hasCancel & "), skipping")
+							try
+								click allowBtn
+								my debugLog("Approved remote-debugging consent sheet (" & processLabel & ")")
+							on error errMsg
+								my debugLog("Click Allow failed: " & errMsg)
+							end try
 						end if
-					on error errMsg
-						my debugLog("Unnamed window check error: " & errMsg)
-					end try
-				end if
-				-- 标准命名窗口【不】做 scanContainer 整页递归：textOfElement 会遍历整棵辅助功能树，
-				-- 在 Google Ads / Gmail 等重页面上会卡死几十秒（实测看守卡在第一个窗口再没动）。
-				-- 授权框是 sheet，由下面的 sheet 扫描兜住，又快又准，顺带不再误匹配页面正文。
-				try
-					set sheetList to every sheet of targetWindow
-				on error
-					set sheetList to {}
-				end try
-				if (count of sheetList) > 0 then my debugLog(processLabel & " sheets=" & (count of sheetList))
-				repeat with s in sheetList
-					my scanContainer(contents of s, dryRun)
+						return -- 点到一个就结束本轮；下一轮 poll 会再看
+					end if
 				end repeat
 			end repeat
 		end tell
 	end tell
 end scanProcess
 
-on scanContainer(targetElement, dryRun)
+-- 判定一个 sheet 是不是远程调试授权框；是则返回它的 Allow 按钮名，否则返回 ""。
+-- 只做廉价的按钮存在性 + 浅层文字检查，不递归整棵树。
+-- 判定一个 sheet 是不是远程调试授权框；是则返回它的 Allow 按钮【元素】，否则 missing value。
+-- 关键：Chrome 这个框里按钮的 name 是空的，标签在 description（截图实测：[AXButton] desc=Allow）。
+-- 所以遍历 sheet 的 entire contents（小，~16 个元素），按 name+description+title+value 匹配，
+-- 不能用 `button "Allow" of s`（按 name 找会全漏）。
+on consentAllowButton(s)
 	tell application "System Events"
-		set uiText to my textOfElement(targetElement)
-		if my looksLikeCdpPrompt(uiText) then
-			my debugLog("Matched Chrome CDP/DevTools prompt: " & my clipText(uiText))
-			if dryRun then
-				my debugLog("Dry run: would approve prompt")
-			else
-				if my clickAllowButton(targetElement) then
-					my debugLog("Approved Chrome CDP/DevTools prompt")
-				else
-					my debugLog("Matched prompt, but no allow button was clickable")
-				end if
-			end if
-		end if
-	end tell
-end scanContainer
-
-on approveViaKeystroke(processLabel, targetWindow, dryRun)
-	set currentTime to (do shell script "date +%s") as number
-	if currentTime - lastApprovalTime < minApprovalInterval then
-		my debugLog("Skipping keystroke approval, too soon since last approval")
-		return
-	end if
-	set lastApprovalTime to currentTime
-	my debugLog("Approving via keystroke on " & processLabel & " (raise target window + Return)")
-	if dryRun then
-		my debugLog("Dry run: would raise target window of " & processLabel & " and press Return")
-		return
-	end if
-	try
-		-- 激活弹框所在的那个浏览器本身（Chrome / Canary / Chromium），不再写死 Google Chrome
-		tell application processLabel to activate
-		delay 0.3
-		tell application "System Events"
-			-- 先把检测到的那个具体窗口抬到最前，确保回车送到它身上，而非别的窗口
-			try
-				perform action "AXRaise" of targetWindow
-			end try
-			keystroke return
-		end tell
-		my debugLog("Sent Return keystroke to " & processLabel & " target window")
-	on error errMsg
-		my debugLog("Keystroke approval failed: " & errMsg)
-	end try
-end approveViaKeystroke
-
-on looksLikeCdpPrompt(uiText)
-	ignoring case
-		-- 第一步：必须包含至少一个 required term
-		set hasRequired to false
-		repeat with t in requiredTerms
-			if uiText contains (t as text) then
-				set hasRequired to true
-				exit repeat
-			end if
-		end repeat
-		if not hasRequired then return false
-
-		-- 第二步：必须同时包含至少一个 confirmation term（避免误匹配普通窗口）
-		repeat with t in confirmationTerms
-			if uiText contains (t as text) then return true
-		end repeat
-	end ignoring
-	return false
-end looksLikeCdpPrompt
-
-on clickAllowButton(rootElement)
-	tell application "System Events"
-		repeat with buttonName in allowButtonNames
-			try
-				if exists button (buttonName as text) of rootElement then
-					click button (buttonName as text) of rootElement
-					return true
-				end if
-			end try
-		end repeat
-		
+		set allowBtn to missing value
+		set hasCancel to false
+		set hasDebugText to false
+		set ec to {}
 		try
-			set roleText to role of rootElement as text
-			ignoring case
-				set isButton to roleText contains "button"
-			end ignoring
-			if isButton then
-				set buttonText to my buttonLabel(rootElement)
-				-- 用空格做词边界，要求允许词作为【完整单词】出现，
-				-- 避免 "Bookmark this tab" 里的 "bo-ok-mark" 子串命中 "Ok" 这类误判
-				set paddedText to " " & buttonText & " "
+			set ec to entire contents of s
+		on error
+			return missing value
+		end try
+		repeat with e in ec
+			set r to ""
+			try
+				set r to role of e as text
+			end try
+			if r is "AXButton" then
+				set lbl to my elemLabel(e)
+				if my labelMatches(lbl, cancelButtonNames) then
+					set hasCancel to true -- 先判 cancel，免得 "Don't allow" 被当成 allow
+				else if my labelMatches(lbl, allowButtonNames) then
+					set allowBtn to (contents of e)
+				end if
+			else if not hasDebugText then
+				-- 文字确认是远程调试框（标题/正文含 debug / remote / full control 等）
+				set txt to my elemLabel(e)
 				ignoring case
-					repeat with buttonName in allowButtonNames
-						if paddedText contains (" " & (buttonName as text) & " ") then
-							my debugLog("Clicking allow button: " & buttonText)
-							click rootElement
-							return true
+					repeat with term in debugTerms
+						if txt contains (term as text) then
+							set hasDebugText to true
+							exit repeat
 						end if
 					end repeat
 				end ignoring
 			end if
-		end try
-		
+		end repeat
+		-- 三条都满足才点：有 Allow 按钮 + 有 Cancel 按钮 + 文字确认是远程调试框
+		if allowBtn is missing value then return missing value
+		if not hasCancel then return missing value
+		if not hasDebugText then return missing value
+		return allowBtn
+	end tell
+end consentAllowButton
+
+-- 元素标签：name + description + title + value 拼一起（按钮标签可能在其中任意一个）
+on elemLabel(e)
+	set p to ""
+	tell application "System Events"
 		try
-			repeat with childElement in UI elements of rootElement
-				if my clickAllowButton(childElement) then return true
-			end repeat
+			set v to name of e
+			if v is not missing value then set p to p & " " & (v as text)
+		end try
+		try
+			set v to description of e
+			if v is not missing value then set p to p & " " & (v as text)
+		end try
+		try
+			set v to title of e
+			if v is not missing value then set p to p & " " & (v as text)
+		end try
+		try
+			set v to value of e
+			if v is not missing value then set p to p & " " & (v as text)
 		end try
 	end tell
+	return p
+end elemLabel
+
+-- 空格词边界匹配：要求名字作为完整单词出现，避免子串误判（如 "Bookmark" 含 "ok"）
+on labelMatches(lbl, nameList)
+	set padded to " " & lbl & " "
+	ignoring case
+		repeat with nm in nameList
+			if padded contains (" " & (nm as text) & " ") then return true
+		end repeat
+	end ignoring
 	return false
-end clickAllowButton
-
-on buttonLabel(rootElement)
-	set pieces to ""
-	tell application "System Events"
-		try
-			set buttonName to name of rootElement
-			if buttonName is not missing value then set pieces to pieces & " " & (buttonName as text)
-		end try
-		try
-			set buttonDescription to description of rootElement
-			if buttonDescription is not missing value then set pieces to pieces & " " & (buttonDescription as text)
-		end try
-		try
-			set buttonValue to value of rootElement
-			if buttonValue is not missing value then set pieces to pieces & " " & (buttonValue as text)
-		end try
-	end tell
-	return pieces
-end buttonLabel
-
-on textOfElement(rootElement)
-	set pieces to ""
-	tell application "System Events"
-		try
-			set elementName to name of rootElement
-			if elementName is not missing value then set pieces to pieces & " " & (elementName as text)
-		end try
-		try
-			set elementDescription to description of rootElement
-			if elementDescription is not missing value then set pieces to pieces & " " & (elementDescription as text)
-		end try
-		try
-			set elementValue to value of rootElement
-			if elementValue is not missing value then set pieces to pieces & " " & (elementValue as text)
-		end try
-		try
-			repeat with childElement in UI elements of rootElement
-				set pieces to pieces & " " & my textOfElement(childElement)
-			end repeat
-		end try
-	end tell
-	return pieces
-end textOfElement
-
-on clipText(inputText)
-	if (length of inputText) > 500 then return text 1 thru 500 of inputText
-	return inputText
-end clipText
+end labelMatches
