@@ -8,6 +8,14 @@ property cancelButtonNames : {"Cancel", "取消", "取消", "Don't allow", "Deny
 property debugTerms : {"debug", "remote", "full control", "远程", "遠端", "调试", "調試"}
 property debugLogPath : "/tmp/cdp-auto-allow.debug.log"
 property deadlinePath : "/tmp/cdp-auto-allow.deadline"
+property procsLogged : false
+-- 每点掉一个真实授权框就把 watch 截止时间往后推这么多秒。
+-- 动机:Codex 启动浏览器走 exec_command(命中 hook、点火 60s),但之后用 write_stdin
+-- 驱动常驻 cdp 代理、不再发新 shell 命令,固定 60s 窗口会在会话中途到期,后续每 ~20s
+-- 复弹的框就没人点了。改成"见框续命":只要框还在弹(=agent 还在连),看守就一直活;
+-- 一旦停手、框不再弹,看守自然过期。仅在 watch 模式(存在 deadline 文件)下生效,
+-- 安全性质不变(仍需先被真实命令点亮、仍会自动收口)。
+property extendOnClickSecs : 60
 
 on debugLog(msg)
 	try
@@ -68,6 +76,17 @@ on scanChromiumBrowsers(dryRun)
 		try
 			set procs to procs & (application processes whose bundle identifier starts with "com.microsoft.edgemac")
 		end try
+		-- 诊断：本次看守启动时记一次"扫了哪几个 Chrome 系进程"
+		if not procsLogged then
+			set pnames to ""
+			repeat with p in procs
+				try
+					set pnames to pnames & (name of p) & " "
+				end try
+			end repeat
+			my debugLog("scanning " & (count of procs) & " procs: " & pnames)
+			set procsLogged to true
+		end if
 		repeat with p in procs
 			set pLabel to "?"
 			try
@@ -119,6 +138,7 @@ on scanProcess(chromeProcess, processLabel, dryRun)
 							try
 								click allowBtn
 								my debugLog("Approved remote-debugging consent sheet (" & processLabel & ")")
+								my extendDeadline() -- 见框续命:跟着真实授权框延长 watch 窗口
 							on error errMsg
 								my debugLog("Click Allow failed: " & errMsg)
 							end try
@@ -130,6 +150,19 @@ on scanProcess(chromeProcess, processLabel, dryRun)
 		end tell
 	end tell
 end scanProcess
+
+-- 见框续命:点掉一个真实授权框后,把 watch 截止时间推到 now+extendOnClickSecs。
+-- 仅在 watch 模式(deadline 文件存在且 >0)下生效;永久模式(无文件)不创建文件。
+-- 只往后推、不缩短(避免把用户手动设的更长窗口改小)。
+on extendDeadline()
+	-- 全程用 shell 算:Unix 时间戳(~17.8 亿)超过 AppleScript 整数上限(2^29),
+	-- 在 AS 里加减会被存成科学计数法、污染 deadline 文件。只把小整数 extendOnClickSecs 传进去。
+	try
+		do shell script "dl=$(cat " & quoted form of deadlinePath & " 2>/dev/null || echo 0); " & ¬
+			"if [ \"$dl\" -gt 0 ]; then new=$(( $(date +%s) + " & (extendOnClickSecs as text) & " )); " & ¬
+			"if [ \"$new\" -gt \"$dl\" ]; then printf '%s' \"$new\" > " & quoted form of deadlinePath & "; fi; fi"
+	end try
+end extendDeadline
 
 -- 判定一个 sheet 是不是远程调试授权框；是则返回它的 Allow 按钮名，否则返回 ""。
 -- 只做廉价的按钮存在性 + 浅层文字检查，不递归整棵树。
@@ -173,6 +206,8 @@ on consentAllowButton(s)
 				end ignoring
 			end if
 		end repeat
+		-- 诊断：看到有内容的 sheet 就记三要素，便于排查"看到框却没点"
+		if (count of ec) > 0 then my debugLog("sheet seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & hasCancel & " debugText=" & hasDebugText & " elems=" & (count of ec))
 		-- 三条都满足才点：有 Allow 按钮 + 有 Cancel 按钮 + 文字确认是远程调试框
 		if allowBtn is missing value then return missing value
 		if not hasCancel then return missing value
