@@ -20,11 +20,11 @@ if (!['add', 'remove'].includes(action) || !hookPath) {
 }
 const HOME = os.homedir();
 
-// 两个 agent 的注册位 —— 注意 matcher 不同:Claude Code 是 "Bash",Codex 是 "exec_command";
+// 两个 agent 的注册位。Codex 不同版本/表面展示过不同命令工具名,所以用兼容 matcher。
 // Codex 的 hook 项还带 timeout / statusMessage。
 const TARGETS = [
   { name: 'Claude Code', file: path.join(HOME, '.claude', 'settings.json'), matcher: 'Bash', extra: {} },
-  { name: 'Codex', file: path.join(HOME, '.codex', 'hooks.json'), matcher: 'exec_command', extra: { timeout: 10, statusMessage: 'arm auto-allow watcher' } },
+  { name: 'Codex', file: path.join(HOME, '.codex', 'hooks.json'), matcher: 'Bash|exec_command|functions\\.exec_command', extra: { timeout: 10, statusMessage: 'arm auto-allow watcher' } },
 ];
 
 const isOurs = (cmd) => typeof cmd === 'string' && cmd.includes('agent-hook.sh');
@@ -51,6 +51,10 @@ for (const t of TARGETS) {
     cfg ??= {};
     cfg.hooks ??= {};
     cfg.hooks.PreToolUse ??= [];
+    for (const e of cfg.hooks.PreToolUse) {
+      if (!e || e.matcher === t.matcher || !Array.isArray(e.hooks)) continue;
+      e.hooks = e.hooks.filter((h) => !isOurs(h && h.command));
+    }
     let entry = cfg.hooks.PreToolUse.find((e) => e && e.matcher === t.matcher);
     if (!entry) { entry = { matcher: t.matcher, hooks: [] }; cfg.hooks.PreToolUse.push(entry); }
     entry.hooks ??= [];
