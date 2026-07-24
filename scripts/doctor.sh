@@ -26,72 +26,48 @@ bold "2. 依赖 + 脚本可执行位"
 for dep in node lsof osascript; do
   if command -v "$dep" >/dev/null 2>&1; then ok "$dep 可用"; else bad "缺 $dep"; fi
 done
-for s in agent-hook.sh conn-arm.sh on-demand.sh cdp-auto-allow.scpt; do
+for s in agent-hook.sh hook-decision.mjs browser-targets.mjs conn-arm.sh conn-arm.mjs on-demand.sh cdp-auto-allow.scpt; do
   if [[ -e "$ROOT_DIR/scripts/$s" ]]; then ok "$s 存在"; else bad "缺 scripts/$s"; fi
 done
 
 echo
-bold "3. Chrome 进程"
-if pgrep -f "/Google Chrome.app/Contents/MacOS/Google Chrome" >/dev/null; then
-  ok "Google Chrome 在运行"
+bold "3. macOS Chromium 浏览器家族"
+installed=0
+for pair in \
+  "Google Chrome|/Applications/Google Chrome.app" \
+  "Google Chrome Beta|/Applications/Google Chrome Beta.app" \
+  "Google Chrome Dev|/Applications/Google Chrome Dev.app" \
+  "Google Chrome Canary|/Applications/Google Chrome Canary.app" \
+  "Chromium|/Applications/Chromium.app" \
+  "Microsoft Edge|/Applications/Microsoft Edge.app" \
+  "Microsoft Edge Beta|/Applications/Microsoft Edge Beta.app" \
+  "Microsoft Edge Dev|/Applications/Microsoft Edge Dev.app" \
+  "Microsoft Edge Canary|/Applications/Microsoft Edge Canary.app"; do
+  name="${pair%%|*}"; app="${pair#*|}"
+  if [[ -d "$app" ]]; then ok "$name 已安装"; installed=$((installed+1)); fi
+done
+if [[ "$installed" = 0 ]]; then
+  warn "未发现受支持浏览器"
+fi
+
+targets="$(node "$ROOT_DIR/scripts/browser-targets.mjs" 2>/dev/null)"
+if [[ -n "$targets" ]]; then
+  while IFS= read -r target; do
+    ok "发现真实调试入口: $target"
+  done <<< "$targets"
 else
-  warn "Google Chrome 没在运行（脚本本身没问题，但暂时也没东西可点）"
+  warn "当前没有受支持浏览器开放调试端口（空闲时是正常状态）"
 fi
 
 echo
 bold "4. /usr/bin/osascript 的 Accessibility 权限"
-# Chrome 未激活时测一次
-deactivate_result=$(/usr/bin/osascript <<'EOF' 2>&1
-tell application "System Events"
-  try
-    if not (exists process "Google Chrome") then return "no-chrome"
-    tell process "Google Chrome"
-      try
-        set n to count of (every window)
-      on error e
-        return "err:" & e
-      end try
-      return "count:" & n
-    end tell
-  on error e
-    return "outer:" & e
-  end try
-end tell
-EOF
-)
-# 激活 Chrome 后再测一次
-activate_result=$(/usr/bin/osascript <<'EOF' 2>&1
-tell application "Google Chrome" to activate
-delay 0.5
-tell application "System Events"
-  try
-    tell process "Google Chrome"
-      try
-        set n to count of (every window)
-      on error e
-        return "err:" & e
-      end try
-      return "count:" & n
-    end tell
-  on error e
-    return "outer:" & e
-  end try
-end tell
-EOF
-)
-case "$deactivate_result" in
-  count:0) warn "Chrome 未激活时 count=0（正常，脚本会自动激活后重试）" ;;
-  count:*) ok "Chrome 未激活时也能读到 ${deactivate_result#count:} 个窗口" ;;
-  no-chrome) warn "Chrome 不在运行，没法测权限" ;;
-  *) bad "调用 System Events 失败: $deactivate_result" ;;
-esac
-case "$activate_result" in
-  count:0)
-    bad "激活 Chrome 后仍 count=0 → 没有 Accessibility 权限"
+access_result=$(/usr/bin/osascript -e 'tell application "System Events" to get UI elements enabled' 2>&1)
+case "$access_result" in
+  true) ok "Accessibility 权限 OK" ;;
+  *)
+    bad "无法使用 Accessibility: $access_result"
     bad "  → System Settings > Privacy & Security > Accessibility"
     bad "  → 添加并启用 /usr/bin/osascript（点 +，按 Cmd+Shift+G 输入 /usr/bin/osascript）" ;;
-  count:*) ok "激活 Chrome 后能读到 ${activate_result#count:} 个窗口 → 权限 OK" ;;
-  *) bad "激活后调用 System Events 失败: $activate_result" ;;
 esac
 
 echo
@@ -108,6 +84,6 @@ fi
 
 echo
 bold "提示"
-echo "  - 想立刻验证:在 Chrome 里触发一次 CDP 连接（跑个连 Chrome 的脚本），再看 debug.log。"
+echo "  - 想立刻验证:在任一受支持浏览器里触发一次 CDP 连接，再看 debug.log。"
 echo "  - 实时跟随:tail -F $DEBUG_LOG"
 echo "  - 触发日志:/tmp/cdp-auto-allow.hook.log（哪些命令 arm 了）+ /tmp/cdp-auto-allow.probe.log（探测器启动）"

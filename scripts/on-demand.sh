@@ -17,6 +17,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCPT="$ROOT_DIR/scripts/cdp-auto-allow.scpt"
 PIDFILE="/tmp/cdp-auto-allow.ondemand.pid"
 DEADLINE="/tmp/cdp-auto-allow.deadline"
+LAUNCH_LOCK="/tmp/cdp-auto-allow.launch.lock"
 OUT_LOG="/tmp/cdp-auto-allow.out.log"
 ERR_LOG="/tmp/cdp-auto-allow.err.log"
 
@@ -26,14 +27,33 @@ is_running() {
 
 launch() {  # 后台拉起看守进程（若未在跑）
   if is_running; then return 0; fi
-  nohup /usr/bin/osascript "$SCPT" >"$OUT_LOG" 2>"$ERR_LOG" &
-  echo $! > "$PIDFILE"
+
+  # 多个连接探测器可能同时命中；用原子目录锁保证只起一个 AppleScript 看守。
+  acquired=0
+  for _ in {1..50}; do
+    if mkdir "$LAUNCH_LOCK" 2>/dev/null; then acquired=1; break; fi
+    if is_running; then return 0; fi
+    sleep 0.02
+  done
+  if [[ "$acquired" = 0 ]]; then
+    # 正常临界区远短于 1 秒；此时仍无看守，空目录可视为上次异常退出留下的锁。
+    rmdir "$LAUNCH_LOCK" 2>/dev/null || return 0
+    mkdir "$LAUNCH_LOCK" 2>/dev/null || return 0
+  fi
+
+  if ! is_running; then
+    nohup /usr/bin/osascript "$SCPT" >"$OUT_LOG" 2>"$ERR_LOG" &
+    printf '%s\n' "$!" > "$PIDFILE.tmp.$$"
+    mv "$PIDFILE.tmp.$$" "$PIDFILE"
+  fi
+  rmdir "$LAUNCH_LOCK" 2>/dev/null || true
 }
 
 case "${1:-}" in
   watch)
     secs="${2:-60}"
-    echo $(( $(date +%s) + secs )) > "$DEADLINE"   # 写/刷新截止时间 = 续期
+    printf '%s\n' "$(( $(date +%s) + secs ))" > "$DEADLINE.tmp.$$"
+    mv "$DEADLINE.tmp.$$" "$DEADLINE"   # 原子写/刷新截止时间 = 续期
     launch
     echo "watching ${secs}s (PID $(cat "$PIDFILE")) — 窗口内出现授权框会被自动点掉，到点自退"
     ;;
