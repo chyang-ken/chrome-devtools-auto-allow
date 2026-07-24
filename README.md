@@ -38,7 +38,7 @@ on-demand 开看守 → scpt 扫到框点「允许」→ 连接结束看守自�
 
 1. 把 `agent-hook.sh` 注册成两个 agent 的 PreToolUse hook：
    - **Claude Code** → `~/.claude/settings.json`（matcher `Bash`）
-   - **Codex** → `~/.codex/hooks.json`（matcher `exec_command`）
+   - **Codex** → `~/.codex/hooks.json`（matcher `Bash|exec_command|functions\.exec_command`）
 2. 提示你给 `/usr/bin/osascript` 授予 **Accessibility 权限**（scpt 点框需要，只此一次）。
 
 > 若自动改不动你的 agent 配置（例如配置是含注释的 JSONC），install 会打印「请手动加这一项」
@@ -69,6 +69,17 @@ on-demand 开看守 → scpt 扫到框点「允许」→ 连接结束看守自�
 最初的实现用 KeepAlive 的 LaunchAgent 让 scpt 7×24 常驻——等于对所有 Chrome 永久关掉
 「每次确认」这道防线。本版改为 PreToolUse hook 按需点火，把风险窗口收缩到「实际在连
 Chrome 的那几秒」。`launchd/` 里的 plist 仅作「无 agent 的常驻兜底」保留，**默认不装、不推荐**。
+
+### 与 upstream 的关系
+
+本 fork 与 upstream `liaocaoxuezhe/chrome-devtools-auto-allow` 已进入**选择性吸收**关系，
+不再把 upstream 的整分支更新视为必须同步的新版。
+
+- **分叉原因**：upstream 选择常驻 LaunchAgent，以全天候自动处理授权换取权限稳定；
+  本 fork 选择连接感知、按需启停，只在 Agent 真实连接 Chrome 的几秒内处理弹窗。
+- **同步策略**：保留 upstream 作为项目来历及安全、浏览器兼容性、弹窗识别修复的参考；
+  不整体 merge，只在确认不破坏按需安全边界后手工吸收适用部分。
+- **重新合流条件**：upstream 提供等价的按需模式，并且默认不安装或启动常驻服务。
 
 ## 依赖
 
