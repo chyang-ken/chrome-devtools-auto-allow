@@ -9,6 +9,9 @@ property debugTerms : {"debug", "remote", "full control", "远程", "遠端", "�
 property debugLogPath : "/tmp/cdp-auto-allow.debug.log"
 property deadlinePath : "/tmp/cdp-auto-allow.deadline"
 property procsLogged : false
+-- Chrome 151 会把远程调试确认框暴露成 AXUnknown 小窗口；用按键兜底时避免重复触发。
+property lastApprovalTime : 0
+property minApprovalInterval : 3
 -- 每点掉一个真实授权框就把 watch 截止时间往后推这么多秒。
 -- 动机:Codex 启动浏览器走 exec_command(命中 hook、点火 60s),但之后用 write_stdin
 -- 驱动常驻 cdp 代理、不再发新 shell 命令,固定 60s 窗口会在会话中途到期,后续每 ~20s
@@ -66,71 +69,86 @@ end run
 -- org.chromium（Chromium）、com.microsoft.edgemac（Edge 及其 PWA）。
 on scanChromiumBrowsers(dryRun)
 	tell application "System Events"
-		set procs to {}
+		-- 不能先拿 application process 对象再逐个读属性：Chrome 151 下多个进程同名，
+		-- System Events 会把每个对象都重新解析成列表中的第一个同名进程。直接批量取 PID 列表。
+		set processIds to {}
+		set processLabels to {}
 		try
-			set procs to procs & (application processes whose bundle identifier starts with "com.google.Chrome")
+			set processIds to processIds & (unix id of every application process whose bundle identifier starts with "com.google.Chrome")
+			set processLabels to processLabels & (name of every application process whose bundle identifier starts with "com.google.Chrome")
 		end try
 		try
-			set procs to procs & (application processes whose bundle identifier starts with "org.chromium")
+			set processIds to processIds & (unix id of every application process whose bundle identifier starts with "org.chromium")
+			set processLabels to processLabels & (name of every application process whose bundle identifier starts with "org.chromium")
 		end try
 		try
-			set procs to procs & (application processes whose bundle identifier starts with "com.microsoft.edgemac")
+			set processIds to processIds & (unix id of every application process whose bundle identifier starts with "com.microsoft.edgemac")
+			set processLabels to processLabels & (name of every application process whose bundle identifier starts with "com.microsoft.edgemac")
 		end try
 		-- 诊断：本次看守启动时记一次"扫了哪几个 Chrome 系进程"
 		if not procsLogged then
 			set pnames to ""
-			repeat with p in procs
-				try
-					set pnames to pnames & (name of p) & " "
-				end try
+			repeat with processIndex from 1 to count of processIds
+				set pnames to pnames & (item processIndex of processLabels as text) & ":" & (item processIndex of processIds as text) & " "
 			end repeat
-			my debugLog("scanning " & (count of procs) & " procs: " & pnames)
+			my debugLog("scanning " & (count of processIds) & " procs: " & pnames)
 			set procsLogged to true
 		end if
-		repeat with p in procs
-			set pLabel to "?"
-			try
-				set pLabel to name of p
-			end try
-			my scanProcess(p, pLabel, dryRun)
+		repeat with processIndex from 1 to count of processIds
+			set processId to item processIndex of processIds
+			set pLabel to item processIndex of processLabels
+			my scanProcess(processId, pLabel, dryRun)
 		end repeat
 	end tell
 end scanChromiumBrowsers
 
 -- 在一个浏览器进程里找授权 sheet 并点 Allow。
--- 顺序：焦点窗口优先（命中就秒退）→ 全部窗口兜底（用户切走窗口时 sheet 仍在原窗口）。
-on scanProcess(chromeProcess, processLabel, dryRun)
+-- Chrome 151 下多个 Chrome/PWA 进程可能同名，必须按 PID 重新定位，不能靠名称引用。
+on scanProcess(processId, processLabel, dryRun)
+	set targetPid to processId
 	tell application "System Events"
-		tell chromeProcess
-			set ordered to {}
-			-- 1) 焦点窗口排最前（加速：授权框通常挂在连接发生时的活动窗口上）
+		tell (first application process whose unix id is targetPid)
+			set windowCount to 0
 			try
-				set end of ordered to (value of attribute "AXFocusedWindow")
+				set windowCount to count of windows
 			end try
-			-- 2) 追加所有窗口做兜底覆盖（焦点窗口会被再查一次，无害）
-			try
-				repeat with w in (every window)
-					set end of ordered to (contents of w)
-				end repeat
-			end try
-			-- 3) Chrome 未激活时可能读不到窗口，激活后再补一次
-			if (count of ordered) is 0 then
+			if windowCount is 0 then
 				try
-					tell application processLabel to activate
+					set frontmost to true
 					delay 0.3
-					repeat with w in (every window)
-						set end of ordered to (contents of w)
-					end repeat
+					set windowCount to count of windows
 				end try
 			end if
-
-			repeat with win in ordered
-				set shts to {}
+			repeat with windowIndex from 1 to windowCount
+				-- Chrome 151 的确认框不再一定是 macOS sheet，可能是独立的 AXUnknown 小窗口。
+				-- 这段选择性吸收 upstream a365e34 的兼容逻辑；看守的按需窗口和其他判断不变。
+				set isSmallDialog to false
 				try
-					set shts to every sheet of win
+					set wSubrole to subrole of window windowIndex as text
+					if wSubrole is "AXUnknown" then
+						try
+							set wSize to size of window windowIndex
+							set wWidth to item 1 of wSize
+							set wHeight to item 2 of wSize
+							if wWidth < 600 and wHeight < 600 then set isSmallDialog to true
+							my debugLog(processLabel & " AXUnknown window size=" & wWidth & "x" & wHeight)
+						on error
+							set isSmallDialog to true
+						end try
+					end if
 				end try
-				repeat with s in shts
-					set allowBtn to my consentAllowButton(s)
+				if isSmallDialog then
+					my approveViaKeystroke(processId, processLabel, dryRun)
+					return
+				end if
+
+				set sheetCount to 0
+				try
+					set sheetCount to count of sheets of window windowIndex
+				end try
+				if sheetCount > 0 then my debugLog("pid=" & processId & " window=" & windowIndex & " sheets=" & sheetCount)
+				repeat with sheetIndex from 1 to sheetCount
+					set allowBtn to my consentAllowButton(a reference to sheet sheetIndex of window windowIndex)
 					if allowBtn is not missing value then
 						if dryRun then
 							my debugLog("Dry run: would click Allow on consent sheet (" & processLabel & ")")
@@ -151,6 +169,42 @@ on scanProcess(chromeProcess, processLabel, dryRun)
 	end tell
 end scanProcess
 
+-- Chrome 151 的 AXUnknown 容器不暴露可点击按钮；激活实际进程后按 Return。
+-- 只有真实浏览器连接先点亮 on-demand watch 后，本脚本才会运行。
+on approveViaKeystroke(processId, processLabel, dryRun)
+	set targetPid to processId
+	set currentTime to (do shell script "date +%s") as number
+	if currentTime - lastApprovalTime < minApprovalInterval then
+		my debugLog("Skipping keystroke approval, too soon since last approval")
+		return
+	end if
+	set lastApprovalTime to currentTime
+	if dryRun then
+		my debugLog("Dry run: would approve Chrome 151 consent dialog (" & processLabel & ")")
+		return
+	end if
+	try
+		tell application "System Events"
+			tell (first application process whose unix id is targetPid) to set frontmost to true
+			delay 0.3
+			key code 36
+		end tell
+		my debugLog("Approved Chrome 151 consent dialog (" & processLabel & ")")
+		my extendDeadline()
+	on error errMsg
+		my debugLog("Chrome 151 keystroke approval failed: " & errMsg)
+	end try
+end approveViaKeystroke
+
+on textMatchesDebugTerm(inputText)
+	ignoring case
+		repeat with term in debugTerms
+			if inputText contains (term as text) then return true
+		end repeat
+	end ignoring
+	return false
+end textMatchesDebugTerm
+
 -- 见框续命:点掉一个真实授权框后,把 watch 截止时间推到 now+extendOnClickSecs。
 -- 仅在 watch 模式(deadline 文件存在且 >0)下生效;永久模式(无文件)不创建文件。
 -- 只往后推、不缩短(避免把用户手动设的更长窗口改小)。
@@ -164,57 +218,55 @@ on extendDeadline()
 	end try
 end extendDeadline
 
--- 判定一个 sheet 是不是远程调试授权框；是则返回它的 Allow 按钮名，否则返回 ""。
--- 只做廉价的按钮存在性 + 浅层文字检查，不递归整棵树。
 -- 判定一个 sheet 是不是远程调试授权框；是则返回它的 Allow 按钮【元素】，否则 missing value。
 -- 关键：Chrome 这个框里按钮的 name 是空的，标签在 description（截图实测：[AXButton] desc=Allow）。
--- 所以遍历 sheet 的 entire contents（小，~16 个元素），按 name+description+title+value 匹配，
--- 不能用 `button "Allow" of s`（按 name 找会全漏）。
-on consentAllowButton(s)
-	tell application "System Events"
-		set allowBtn to missing value
-		set hasCancel to false
-		set hasDebugText to false
-		set ec to {}
-		try
-			set ec to entire contents of s
-		on error
-			return missing value
-		end try
-		repeat with e in ec
-			set r to ""
-			try
-				set r to role of e as text
-			end try
-			if r is "AXButton" then
-				set lbl to my elemLabel(e)
-				if my labelMatches(lbl, cancelButtonNames) then
-					set hasCancel to true -- 先判 cancel，免得 "Don't allow" 被当成 allow
-				else if my labelMatches(lbl, allowButtonNames) then
-					set allowBtn to (contents of e)
-				end if
-			else if not hasDebugText then
-				-- 文字确认是远程调试框（标题/正文含 debug / remote / full control 等）
-				set txt to my elemLabel(e)
-				ignoring case
-					repeat with term in debugTerms
-						if txt contains (term as text) then
-							set hasDebugText to true
-							exit repeat
-						end if
-					end repeat
-				end ignoring
-			end if
-		end repeat
-		-- 诊断：看到有内容的 sheet 就记三要素，便于排查"看到框却没点"
-		if (count of ec) > 0 then my debugLog("sheet seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & hasCancel & " debugText=" & hasDebugText & " elems=" & (count of ec))
-		-- 三条都满足才点：有 Allow 按钮 + 有 Cancel 按钮 + 文字确认是远程调试框
-		if allowBtn is missing value then return missing value
-		if not hasCancel then return missing value
-		if not hasDebugText then return missing value
-		return allowBtn
-	end tell
+-- Chrome 151 对 sheet 的 `entire contents` 返回空列表，必须沿 `UI elements` 递归；
+-- 递归范围只限这个小 sheet，不会扫描普通网页窗口。
+on consentAllowButton(sheetRef)
+	set allowBtn to my findButtonRecursive(sheetRef, allowButtonNames, 0)
+	set cancelBtn to my findButtonRecursive(sheetRef, cancelButtonNames, 0)
+	set hasDebugText to my treeHasDebugText(sheetRef, 0)
+	my debugLog("sheet seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & (cancelBtn is not missing value) & " debugText=" & hasDebugText & " recursive=true")
+	if allowBtn is missing value then return missing value
+	if cancelBtn is missing value then return missing value
+	if not hasDebugText then return missing value
+	return allowBtn
 end consentAllowButton
+
+on findButtonRecursive(rootElement, buttonNames, depth)
+	if depth > 12 then return missing value
+	tell application "System Events"
+		set r to ""
+		try
+			set r to role of rootElement as text
+		end try
+		if r is "AXButton" then
+			set lbl to my elemLabel(rootElement)
+			if my labelMatches(lbl, buttonNames) then return rootElement
+		end if
+		try
+			repeat with childElement in UI elements of rootElement
+				set foundButton to my findButtonRecursive(childElement, buttonNames, depth + 1)
+				if foundButton is not missing value then return foundButton
+			end repeat
+		end try
+	end tell
+	return missing value
+end findButtonRecursive
+
+on treeHasDebugText(rootElement, depth)
+	if depth > 12 then return false
+	set txt to my elemLabel(rootElement)
+	if my textMatchesDebugTerm(txt) then return true
+	tell application "System Events"
+		try
+			repeat with childElement in UI elements of rootElement
+				if my treeHasDebugText(childElement, depth + 1) then return true
+			end repeat
+		end try
+	end tell
+	return false
+end treeHasDebugText
 
 -- 元素标签：name + description + title + value 拼一起（按钮标签可能在其中任意一个）
 on elemLabel(e)
