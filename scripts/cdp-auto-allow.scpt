@@ -5,7 +5,9 @@ use scripting additions
 -- （旧实现对每个普通窗口递归整棵辅助功能树，在 Google Ads/Gmail 等重页面上会卡死几十秒）。
 property allowButtonNames : {"Allow", "允许", "允許", "OK", "Ok", "确定", "確認", "好"}
 property cancelButtonNames : {"Cancel", "取消", "取消", "Don't allow", "Deny"}
-property debugTerms : {"remote debugging", "full control", "external app", "远程调试", "遠端偵錯", "遠端調試"}
+property directDebugTerms : {"remote debugging", "远程调试", "遠端偵錯", "遠端調試"}
+property externalAppTerms : {"external app", "外部应用", "外部應用程式"}
+property fullControlTerms : {"full control", "完全控制", "完整控制"}
 property debugLogPath : "/tmp/cdp-auto-allow.debug.log"
 property deadlinePath : "/tmp/cdp-auto-allow.deadline"
 property procsLogged : false
@@ -174,14 +176,14 @@ on scanProcess(processId, processLabel, dryRun)
 	end tell
 end scanProcess
 
-on textMatchesDebugTerm(inputText)
+on textMatchesAnyTerm(inputText, termList)
 	ignoring case
-		repeat with term in debugTerms
+		repeat with term in termList
 			if inputText contains (term as text) then return true
 		end repeat
 	end ignoring
 	return false
-end textMatchesDebugTerm
+end textMatchesAnyTerm
 
 -- 见框续命:点掉一个真实授权框后,把 watch 截止时间推到 now+extendOnClickSecs。
 -- 仅在 watch 模式(deadline 文件存在且 >0)下生效;永久模式(无文件)不创建文件。
@@ -204,11 +206,16 @@ on consentAllowButton(containerRef)
 	-- "Don't allow" 同时包含单词 "allow"；查允许按钮时必须显式排除拒绝标签。
 	set allowBtn to my findButtonRecursive(containerRef, allowButtonNames, cancelButtonNames, 0)
 	set cancelBtn to my findButtonRecursive(containerRef, cancelButtonNames, {}, 0)
-	set hasDebugText to my treeHasDebugText(containerRef, 0)
-	my debugLog("consent container seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & (cancelBtn is not missing value) & " debugText=" & hasDebugText & " recursive=true")
+	set textSignals to my treeConsentSignals(containerRef, 0)
+	set hasDirectDebugText to item 1 of textSignals
+	set hasExternalAppText to item 2 of textSignals
+	set hasFullControlText to item 3 of textSignals
+	-- 明确的 remote debugging/本地化文本可独立成立；通用措辞必须 external app + full control 同时出现。
+	set hasConfirmedDebugText to hasDirectDebugText or (hasExternalAppText and hasFullControlText)
+	my debugLog("consent container seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & (cancelBtn is not missing value) & " directDebug=" & hasDirectDebugText & " externalApp=" & hasExternalAppText & " fullControl=" & hasFullControlText & " confirmedText=" & hasConfirmedDebugText & " recursive=true")
 	if allowBtn is missing value then return missing value
 	if cancelBtn is missing value then return missing value
-	if not hasDebugText then return missing value
+	if not hasConfirmedDebugText then return missing value
 	return allowBtn
 end consentAllowButton
 
@@ -233,19 +240,26 @@ on findButtonRecursive(rootElement, buttonNames, excludedNames, depth)
 	return missing value
 end findButtonRecursive
 
-on treeHasDebugText(rootElement, depth)
-	if depth > 12 then return false
+on treeConsentSignals(rootElement, depth)
+	if depth > 12 then return {false, false, false}
 	set txt to my elemLabel(rootElement)
-	if my textMatchesDebugTerm(txt) then return true
+	set hasDirectDebugText to my textMatchesAnyTerm(txt, directDebugTerms)
+	set hasExternalAppText to my textMatchesAnyTerm(txt, externalAppTerms)
+	set hasFullControlText to my textMatchesAnyTerm(txt, fullControlTerms)
+	if hasDirectDebugText or (hasExternalAppText and hasFullControlText) then return {hasDirectDebugText, hasExternalAppText, hasFullControlText}
 	tell application "System Events"
 		try
 			repeat with childElement in UI elements of rootElement
-				if my treeHasDebugText(childElement, depth + 1) then return true
+				set childSignals to my treeConsentSignals(childElement, depth + 1)
+				if item 1 of childSignals then set hasDirectDebugText to true
+				if item 2 of childSignals then set hasExternalAppText to true
+				if item 3 of childSignals then set hasFullControlText to true
+				if hasDirectDebugText or (hasExternalAppText and hasFullControlText) then return {hasDirectDebugText, hasExternalAppText, hasFullControlText}
 			end repeat
 		end try
 	end tell
-	return false
-end treeHasDebugText
+	return {hasDirectDebugText, hasExternalAppText, hasFullControlText}
+end treeConsentSignals
 
 -- 元素标签：name + description + title + value 拼一起（按钮标签可能在其中任意一个）
 on elemLabel(e)
