@@ -5,13 +5,10 @@ use scripting additions
 -- （旧实现对每个普通窗口递归整棵辅助功能树，在 Google Ads/Gmail 等重页面上会卡死几十秒）。
 property allowButtonNames : {"Allow", "允许", "允許", "OK", "Ok", "确定", "確認", "好"}
 property cancelButtonNames : {"Cancel", "取消", "取消", "Don't allow", "Deny"}
-property debugTerms : {"debug", "remote", "full control", "远程", "遠端", "调试", "調試"}
+property debugTerms : {"remote debugging", "full control", "external app", "远程调试", "遠端偵錯", "遠端調試"}
 property debugLogPath : "/tmp/cdp-auto-allow.debug.log"
 property deadlinePath : "/tmp/cdp-auto-allow.deadline"
 property procsLogged : false
--- Chrome 151 会把远程调试确认框暴露成 AXUnknown 小窗口；用按键兜底时避免重复触发。
-property lastApprovalTime : 0
-property minApprovalInterval : 3
 -- 每点掉一个真实授权框就把 watch 截止时间往后推这么多秒。
 -- 动机:Codex 启动浏览器走 exec_command(命中 hook、点火 60s),但之后用 write_stdin
 -- 驱动常驻 cdp 代理、不再发新 shell 命令,固定 60s 窗口会在会话中途到期,后续每 ~20s
@@ -112,16 +109,11 @@ on scanProcess(processId, processLabel, dryRun)
 			try
 				set windowCount to count of windows
 			end try
-			if windowCount is 0 then
-				try
-					set frontmost to true
-					delay 0.3
-					set windowCount to count of windows
-				end try
-			end if
+			-- 读不到窗口时失败关闭。扫描本身绝不能激活 Chrome/PWA，否则每轮轮询都会抢焦点。
+			if windowCount is 0 then return
 			repeat with windowIndex from 1 to windowCount
 				-- Chrome 151 的确认框不再一定是 macOS sheet，可能是独立的 AXUnknown 小窗口。
-				-- 这段选择性吸收 upstream a365e34 的兼容逻辑；看守的按需窗口和其他判断不变。
+				-- 只把尺寸作为缩小递归范围的条件；它本身绝不是授权依据。
 				set isSmallDialog to false
 				try
 					set wSubrole to subrole of window windowIndex as text
@@ -130,16 +122,29 @@ on scanProcess(processId, processLabel, dryRun)
 							set wSize to size of window windowIndex
 							set wWidth to item 1 of wSize
 							set wHeight to item 2 of wSize
-							if wWidth < 600 and wHeight < 600 then set isSmallDialog to true
+							if wWidth > 0 and wHeight > 0 and wWidth < 600 and wHeight < 600 then set isSmallDialog to true
 							my debugLog(processLabel & " AXUnknown window size=" & wWidth & "x" & wHeight)
-						on error
-							set isSmallDialog to true
 						end try
 					end if
 				end try
 				if isSmallDialog then
-					my approveViaKeystroke(processId, processLabel, dryRun)
-					return
+					set allowBtn to my consentAllowButton(a reference to window windowIndex)
+					if allowBtn is not missing value then
+						if dryRun then
+							my debugLog("Dry run: would click Allow on confirmed AXUnknown dialog (" & processLabel & ")")
+						else
+							try
+								click allowBtn
+								my debugLog("Approved confirmed AXUnknown remote-debugging dialog (" & processLabel & ")")
+								my extendDeadline()
+							on error errMsg
+								my debugLog("Click confirmed AXUnknown Allow failed: " & errMsg)
+							end try
+						end if
+						return
+					else
+						my debugLog("Ignoring unconfirmed AXUnknown dialog (" & processLabel & ")")
+					end if
 				end if
 
 				set sheetCount to 0
@@ -169,33 +174,6 @@ on scanProcess(processId, processLabel, dryRun)
 	end tell
 end scanProcess
 
--- Chrome 151 的 AXUnknown 容器不暴露可点击按钮；激活实际进程后按 Return。
--- 只有真实浏览器连接先点亮 on-demand watch 后，本脚本才会运行。
-on approveViaKeystroke(processId, processLabel, dryRun)
-	set targetPid to processId
-	set currentTime to (do shell script "date +%s") as number
-	if currentTime - lastApprovalTime < minApprovalInterval then
-		my debugLog("Skipping keystroke approval, too soon since last approval")
-		return
-	end if
-	set lastApprovalTime to currentTime
-	if dryRun then
-		my debugLog("Dry run: would approve Chrome 151 consent dialog (" & processLabel & ")")
-		return
-	end if
-	try
-		tell application "System Events"
-			tell (first application process whose unix id is targetPid) to set frontmost to true
-			delay 0.3
-			key code 36
-		end tell
-		my debugLog("Approved Chrome 151 consent dialog (" & processLabel & ")")
-		my extendDeadline()
-	on error errMsg
-		my debugLog("Chrome 151 keystroke approval failed: " & errMsg)
-	end try
-end approveViaKeystroke
-
 on textMatchesDebugTerm(inputText)
 	ignoring case
 		repeat with term in debugTerms
@@ -218,22 +196,23 @@ on extendDeadline()
 	end try
 end extendDeadline
 
--- 判定一个 sheet 是不是远程调试授权框；是则返回它的 Allow 按钮【元素】，否则 missing value。
+-- 判定一个小型容器是不是远程调试授权框；是则返回它的 Allow 按钮【元素】，否则 missing value。
 -- 关键：Chrome 这个框里按钮的 name 是空的，标签在 description（截图实测：[AXButton] desc=Allow）。
--- Chrome 151 对 sheet 的 `entire contents` 返回空列表，必须沿 `UI elements` 递归；
--- 递归范围只限这个小 sheet，不会扫描普通网页窗口。
-on consentAllowButton(sheetRef)
-	set allowBtn to my findButtonRecursive(sheetRef, allowButtonNames, 0)
-	set cancelBtn to my findButtonRecursive(sheetRef, cancelButtonNames, 0)
-	set hasDebugText to my treeHasDebugText(sheetRef, 0)
-	my debugLog("sheet seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & (cancelBtn is not missing value) & " debugText=" & hasDebugText & " recursive=true")
+-- Chrome 151 对容器的 `entire contents` 返回空列表，必须沿 `UI elements` 递归；
+-- 调用方只会传入 sheet 或已确认尺寸很小的 AXUnknown 窗口，不会扫描普通网页窗口。
+on consentAllowButton(containerRef)
+	-- "Don't allow" 同时包含单词 "allow"；查允许按钮时必须显式排除拒绝标签。
+	set allowBtn to my findButtonRecursive(containerRef, allowButtonNames, cancelButtonNames, 0)
+	set cancelBtn to my findButtonRecursive(containerRef, cancelButtonNames, {}, 0)
+	set hasDebugText to my treeHasDebugText(containerRef, 0)
+	my debugLog("consent container seen: allowBtn=" & (allowBtn is not missing value) & " cancel=" & (cancelBtn is not missing value) & " debugText=" & hasDebugText & " recursive=true")
 	if allowBtn is missing value then return missing value
 	if cancelBtn is missing value then return missing value
 	if not hasDebugText then return missing value
 	return allowBtn
 end consentAllowButton
 
-on findButtonRecursive(rootElement, buttonNames, depth)
+on findButtonRecursive(rootElement, buttonNames, excludedNames, depth)
 	if depth > 12 then return missing value
 	tell application "System Events"
 		set r to ""
@@ -242,11 +221,11 @@ on findButtonRecursive(rootElement, buttonNames, depth)
 		end try
 		if r is "AXButton" then
 			set lbl to my elemLabel(rootElement)
-			if my labelMatches(lbl, buttonNames) then return rootElement
+			if my labelMatches(lbl, buttonNames) and not my labelMatches(lbl, excludedNames) then return rootElement
 		end if
 		try
 			repeat with childElement in UI elements of rootElement
-				set foundButton to my findButtonRecursive(childElement, buttonNames, depth + 1)
+				set foundButton to my findButtonRecursive(childElement, buttonNames, excludedNames, depth + 1)
 				if foundButton is not missing value then return foundButton
 			end repeat
 		end try
